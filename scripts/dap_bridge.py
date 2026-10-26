@@ -66,7 +66,16 @@ class Slot:
 
     def pipeline(self, requests):
         with self.lock:
-            return self.dap.pipeline(requests)
+            try:
+                return self.dap.pipeline(requests)
+            except DAPError:
+                self.dap.synced = False                   # in step again with the next request
+                raise
+
+    def resync(self):
+        """Start a new sequence with the next request: another host may have used the slot since."""
+        with self.lock:
+            self.dap.synced = False
 
     def command(self, request):
         return self.pipeline([request])[0]
@@ -77,6 +86,7 @@ class Slot:
 
 
 def serve(connection, probe):
+    probe.resync()
     dap = probe.dap
     while True:
         # Wait for one request, then take every one that is already here.
@@ -113,6 +123,7 @@ def listen(address, port, probe, slot):
 
 def uart_serve(connection, probe, baud):
     """The target's bytes to the client, the client's to the target, until either side ends."""
+    probe.resync()
     size = probe.packet_size()
     for request in (bytes([0x1F, 2]), bytes([0x20, 0]) + struct.pack("<I", baud), bytes([0x22, 0x55])):
         response = probe.command(request)
