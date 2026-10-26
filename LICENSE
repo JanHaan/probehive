@@ -1,0 +1,27 @@
+probehive
+Copyright (c) 2026 Jan Haan
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+This repository is dual-licensed.  You may use it under the terms of either
+
+  * the MIT license, in LICENSE-MIT, or
+  * the Apache License, Version 2.0, in LICENSE-APACHE,
+
+at your option.  You need not comply with both; pick whichever one suits
+you.  The MIT option exists because Apache-2.0 is incompatible with GPLv2,
+so a GPLv2 project can take the MIT terms instead.
+
+These terms cover probehive's own material: the gateware, the firmware, the
+simulations, the scripts and the documentation.
+
+The tree contains no third-party code.  The flake fetches what the build
+needs, each under its own license: LiteX, LiteEth and LiteX-Boards
+(BSD-2-Clause), VexRiscv as LiteX's pregenerated Verilog (MIT), and the
+openXC7 toolchain or AMD's Vivado.  A bitstream built from this tree
+contains LiteX's, LiteEth's and VexRiscv's gateware; passing one on, keep
+their notices with it.
+
+Unless you state otherwise, a contribution you intentionally submit for
+inclusion in this repository is licensed under the same dual terms, without
+any additional conditions.
