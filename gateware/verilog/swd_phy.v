@@ -17,9 +17,15 @@
 // as DAP.c clocks a DAP_SWD_Sequence: a line reset of 50 ones may span operations, and a TARGETSEL
 // of bits driven, read and driven again (as OpenOCD sends it) lands on the cycle.  A run's bits
 // read come in a round trip after its slots, so they are taken by a capture of their own and given
-// as its result while the runs after it go on; the engine does not park before they are in.  With nothing offered the engine parks: SWCLK high, SWDIO
-// driven low.  A transfer that fails (WAIT after its retries, FAULT, no or a late ACK, a parity
-// error) halts the engine: it takes nothing more until `resume`.
+// as its result while the runs after it go on.  Between commands the wire carries only what the
+// host sends, as DAP.c clocks nothing between them: a run of bits driven that starts the engine
+// has its first bit in its first cycle, and a run that ends with nothing offered stops the clock
+// at its last rising edge, SWCLK high; the bits of a run read still on the way come in with SWCLK
+// held high.  Transfers keep two idle cycles before the first, low, and a few idle slots after the
+// last while the engine waits for another before it parks, which in SWD are only idle.  A run
+// read that starts the engine has an idle slot before it, released.  Parked, SWCLK is high and
+// SWDIO driven low.  A transfer that fails (WAIT after its retries, FAULT, no or a late ACK, a
+// parity error) halts the engine: it takes nothing more until `resume`.
 //
 // A bit the target puts out on a rising edge reaches the probe a round trip later, which at tens
 // of MHz is more than half a period.  The engine therefore reads each bit `sample` ticks after
@@ -164,6 +170,7 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
    wire [10:0] cnt1      = (cnt0 == 0) ? period_m1 : cnt0 - 1;
    wire [10:0] cnt0_next = (cnt1 == 0) ? period_m1 : cnt1 - 1;
    reg         running, go, arm, stopping;
+   reg         hush;                     // SWCLK held high while the bits of a run read come in
    // The compares on the count are made a cycle early and held: they start every path that decides
    // what the pins and the input side do.  The count steps down by two a cycle around the period,
    // so it becomes X next cycle when it is X + 2 (around the period) now: a compare of two
@@ -358,11 +365,15 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
                       (sq == SQ_DECIDE && !rnw && ack_ok_now) ? wdata[0] : 1'b0;
 
    // The pins.  Parked, SWCLK is high and SWDIO driven low.
-   wire       new_o  = (ctl == C_RUN && ev) ? value : line_o;
-   wire       new_oe = (ctl == C_RUN && ev) ? drive : line_oe;
-   assign swclk = running ? {cnt1 >= lo, cnt0 >= lo} : 2'b11;
-   assign swdo  = (ctl == C_RUN && evA) ? {new_o, line_o} : {new_o, new_o};
-   assign swwr  = (ctl == C_RUN && evA) ? {new_oe, line_oe} : {new_oe, new_oe};
+   wire       ev_on  = ctl == C_RUN && !hush;                 // Events change the line: not hushed
+   // A run of bits that ends with nothing offered.  The rising edge that ends its last slot can
+   // come in the cycle of the event that puts that slot out, before `stopping` is set.
+   wire       run_end = ev_on && ev && (sq == SQ_DATA) && (sq_left == 0) && (is_out || is_in) && !nx_ok;
+   wire       new_o  = (ev_on && ev) ? value : line_o;
+   wire       new_oe = (ev_on && ev) ? drive : line_oe;
+   assign swclk = (running && !hush) ? {cnt1 >= lo, cnt0 >= lo} : 2'b11;
+   assign swdo  = (ev_on && evA) ? {new_o, line_o} : {new_o, new_o};
+   assign swwr  = (ev_on && evA) ? {new_oe, line_oe} : {new_oe, new_oe};
 
    // Taking the operation offered: its fields become the running one's
    task take;
@@ -409,9 +420,13 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
       end else if (running) begin
          cnt0 <= cnt0_next;
          if (rise0 || rise1) begin first <= 0; rawf <= 0; end
-         if ((rise0 || rise1) && stopping) begin
-            running <= 0;                                     // SWCLK stays high from here
-            ctl     <= C_DONE;
+         if ((rise0 || rise1) && (stopping || run_end) && !hush) begin
+            // SWCLK stays high from here; the count runs on while bits read are on the way
+            if (raw_pending) hush <= 1;
+            else begin running <= 0; ctl <= C_DONE; end
+         end
+         if (hush && !raw_pending) begin
+            running <= 0; hush <= 0; ctl <= C_DONE;
          end
       end
 
@@ -434,10 +449,16 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
                 sample <= cfg_sample[6] ? {5'd0, cfg_sample[5:0]} : auto_sample;
                 smod   <= cfg_sample[6] ? {5'd0, cfg_sample[5:0]} : auto_sample;
              end
-             sper <= 0; prep_wait <= 1;
+             sper <= 0; prep_wait <= 1; hush <= 0;
              // Take the pins, parked as the slot leaves them
              own <= 1; line_o <= 0; line_oe <= 1;
-             sq  <= SQ_PRE; sq_left <= 1;
+             if (nx_kind == K_OUT) begin
+                // Its first bit in the first cycle, as DAP.c clocks a sequence
+                sq <= SQ_DATA; sq_left <= {1'b0, nx_bits}; writing <= 1; wdata_sr <= nx_wdata;
+                after_op <= 1; clr <= 1;
+             end else begin
+                sq <= SQ_PRE; sq_left <= 1;
+             end
              ctl <= C_PREP;
           end
 
@@ -456,7 +477,7 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
           end
 
         C_RUN:
-          if (ev) begin
+          if (ev && !hush) begin
              // This event puts the next slot on the line ...
              line_o  <= value;
              line_oe <= drive;
@@ -518,8 +539,15 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
                     end else if (is_xfer || is_cal) begin
                        if (idle != 0) begin sq <= SQ_LOW; sq_left <= idle - 1; end
                        else sq <= SQ_NEXT;
+                    end else if (!nx_ok) begin
+                       // Nothing follows: no cycle the host did not send.  A run read gives its
+                       // result from the capture.
+                       if (!is_in) result(3'b001, 1'b0);
+                       accounted <= 1;
+                       stopping  <= 1;
+                       sq        <= SQ_PARK;
                     end else
-                       sq <= SQ_NEXT;
+                       sq <= SQ_NEXT;                         // A transfer: after an idle slot
                  end else begin
                     sq_left  <= sq_left - 1;
                     wdata_sr <= wdata_sr >> 1;
@@ -633,7 +661,7 @@ module swd_phy #(parameter DEFAULT_SAMPLE = 5) (
       // A reset stops the engine and parks the pins; everything else starts from its initial
       // value, and a reset reaching every register would cost the whole cycle in routing
       if (rst_q) begin
-         ctl <= C_IDLE; own <= 0; running <= 0; arm <= 0; go <= 0; halted <= 0;
+         ctl <= C_IDLE; own <= 0; running <= 0; arm <= 0; go <= 0; halted <= 0; hush <= 0;
          line_o <= 0; line_oe <= 1; rq_w <= 0; rres_w <= 0; rres_r <= 0; rawf <= 0;
       end
    end

@@ -28,8 +28,9 @@ OpenOCD).
   reads, value match, WAIT retries, the end of a command at a FAULT.  The
   engine reads SWDIO a calibrated delay after the edge that sent it, so the
   round trip through cables and level shifting may exceed half a period.
-  DAP_SWJ_Sequence and DAP_SWD_Sequence land on the cycle, so multidrop
-  TARGETSEL works whichever way the host sends it.
+  DAP_SWJ_Sequence and DAP_SWD_Sequence land on the cycle, and nothing is
+  clocked between two of them, so multidrop TARGETSEL and the wake from
+  dormant work whichever way the host sends them.
 - **JTAG**, up to 50 MHz on the wire (an ESP32 runs to 33 MHz here; it is
   rated for 20).  DAP_JTAG_Sequence and DAP_SWJ_Sequence run in gateware;
   that is all probe-rs and OpenOCD need for Xtensa and RISC-V.
@@ -166,7 +167,8 @@ a time, so each costs a round trip.
   (VexRiscv, RV32IM, at 50 MHz).
 - `sim/`: `slot_sim.py` checks an SWD slot byte for byte against a port of
   DAP.c on a modelled target, over clocks and round trips, `--multidrop`
-  with TARGETSEL sent as OpenOCD and probe-rs send it; `jtag_sim.py` does
+  with TARGETSEL sent as OpenOCD and probe-rs send it, `--dormant` with
+  the target woken from dormant as both wake it; `jtag_sim.py` does
   the same for a JTAG slot on a modelled TAP; `soc_sim.py` runs the whole
   SoC, firmware included, against those targets and UART loopbacks.
 - `scripts/`: the host side, the self-check, and the build's helpers.

@@ -12,8 +12,13 @@ With --multidrop the target is an SWD-DP on a multi-drop bus, selected only by a
 lands on the cycle after a line reset, as OpenOCD (DAP_SWD_Sequence: bits driven, read, driven)
 and probe-rs (DAP_SWJ_Sequence) send it; a sequence clocked a cycle more or less selects nothing.
 
+With --dormant the target starts dormant and wakes only on the selection alert, exactly four cycles
+low and the activation code, so a probe that clocks a cycle between two DAP_SWJ_Sequence commands,
+as probe-rs splits the wake-up, leaves it asleep.
+
     python3 sim/slot_sim.py [--clock 50e6] [--round-trip 20] [--wait-every 0] [--fault-at 0]
-                            [--write-fault-at 0] [--seed 1] [--random 20] [--multidrop] [--vcd]
+                            [--write-fault-at 0] [--seed 1] [--random 20] [--multidrop]
+                            [--dormant] [--vcd]
 
 The engine's clock is 100 MHz; SWCLK is a whole number of half cycles of it, at least four, the
 fastest that is not above --clock.  Exits non-zero on any difference.
@@ -36,16 +41,21 @@ OK, WAIT, FAULT = 1, 2, 4
 DPIDR = 0x0BC12477
 TARGETID = 0x01002927                                   # the RP2040's core 0
 MEM_WORDS = 1024
+ALERT_BYTES = bytes([0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D, 0x85, 0x86,       # ADIv5.2 selection alert
+                     0xE9, 0xAF, 0xDD, 0xE3, 0xA2, 0x0E, 0xBC, 0x19])
+SELECTION_ALERT = [(ALERT_BYTES[i // 8] >> (i % 8)) & 1 for i in range(128)]
 
 
 # The target, as sim/slot_target.v has it =================================================================
 
 class Target:
-    def __init__(self, wait_every=0, fault_at=0, write_fault_at=0, multidrop=False):
+    def __init__(self, wait_every=0, fault_at=0, write_fault_at=0, multidrop=False, dormant=False):
         self.wait_every, self.fault_at, self.write_fault_at = wait_every, fault_at, write_fault_at
         # Multi-drop: selected only by a TARGETSEL with TARGETID right after a line reset
         self.multidrop, self.selected, self.awaiting = multidrop, not multidrop, False
         self.ones, self.seen = 0, []
+        # Dormant: woken by the selection alert, four cycles low and the activation code
+        self.dormant, self.hist, self.act, self.after_reset = dormant, [], None, None
         self.requests = self.writes = 0
         self.sticky = False
         self.ctrlstat = self.select = self.tar = self.ap8 = self.ap_buf = 0
@@ -66,6 +76,28 @@ class Target:
     def wire(self, bits):
         """Bits a sequence puts on the line (a released one reads as the pull-up's 1)."""
         for b in bits:
+            self.hist = (self.hist + [b])[-128:]
+            if self.dormant:
+                if self.act is not None:
+                    self.act.append(b)
+                    if len(self.act) == 12:
+                        self.dormant = self.act != [0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0]
+                        self.act = None
+                elif self.hist == SELECTION_ALERT:
+                    self.act = []
+                self.ones = self.ones + 1 if b else 0
+                continue
+            if not b and self.ones >= 50:
+                self.after_reset = [b]
+            elif self.after_reset is not None:
+                self.after_reset.append(b)
+                if len(self.after_reset) == 16:
+                    if sum(x << i for i, x in enumerate(self.after_reset)) == 0xE3BC:
+                        self.dormant, self.selected, self.awaiting = True, not self.multidrop, False
+                        self.ones = 0
+                        self.after_reset = None
+                        continue
+                    self.after_reset = None
             if self.multidrop and not b and self.ones >= 50:
                 self.selected, self.awaiting, self.seen = False, True, []
             self.ones = self.ones + 1 if b else 0
@@ -85,7 +117,8 @@ class Target:
 
     def xfer(self, apndp, rnw, a, data=0):
         self.ones = 0
-        if not self.selected:
+        self.after_reset = None
+        if self.dormant or not self.selected:
             self.awaiting = False
             return 7, None                                   # nothing answers
         if rnw and not apndp and a == 0:
@@ -431,6 +464,34 @@ def multidrop_script(rng, randoms):
     return cmds
 
 
+def swj(data, bits):
+    return bytes([0x12, bits & 0xFF]) + data
+
+
+def dormant_script(rng, randoms, multidrop=False):
+    """A dormant target, woken as probe-rs does it, a DAP_SWJ_Sequence a part, and as OpenOCD does,
+    one for all; the bits between two commands are only those the host sends."""
+    select = [targetsel_probe_rs(TARGETID)] if multidrop else []
+    work = [transfer((DP_R(0), None)),
+            transfer((DP_W(1), 0x50000000), (DP_W(2), 0), (AP_W(1), 0x80), (AP_W(3), 0xFEEDF00D),
+                     (AP_W(1), 0x80), (AP_R(3), None), (DP_R(1), None))]
+    cmds = [transfer((DP_R(0), None)),                                         # dormant: no answer
+            # probe-rs: a line reset, JTAG to dormant, 8 cycles high, the alert, then 4 low and
+            # the activation code, each a command of its own
+            swj(bytes([0xFF] * 6 + [0x07]), 51), swj(bytes([0xBA, 0xBB, 0xBB, 0x33]), 31),
+            swj(bytes([0xFF]), 8), swj(ALERT_BYTES, 128), swj(bytes([0xA0, 0x01]), 12),
+            LINE_RESET] + select + work + [
+            # Back to dormant: 56 cycles high, then SWD to dormant at once
+            swj(bytes([0xFF] * 7), 56), swj(bytes([0xBC, 0xE3]), 16), transfer((DP_R(0), None)),
+            # OpenOCD: 8 high, the alert, 4 low, the code, and a line reset, in one
+            swj(bytes([0xFF]) + ALERT_BYTES + bytes([0xA0, 0xF1, 0xFF] + [0xFF] * 7 + [0x00]), 224)
+            ] + select + work
+    for _ in range(randoms):
+        cmds.append(transfer(*[(AP_W(1), rng.randrange(0, MEM_WORDS) * 4) if rng.random() < 0.3
+                               else (AP_R(3), None) for _ in range(rng.randrange(1, 8))]))
+    return cmds
+
+
 # The testbench =============================================================================================
 
 TESTBENCH = r"""
@@ -498,7 +559,7 @@ module tb;
     assign swdi = swwr ? swdo : (drive_late ? bit_late : 1'b1);
     swd_target #(.WAIT_EVERY(%(wait_every)d), .FAULT_AT(%(fault_at)d),
                  .WRITE_FAULT_AT(%(write_fault_at)d),
-                 .MULTIDROP(%(multidrop)d)) target(.swclk(swclk), .line(swdi),
+                 .MULTIDROP(%(multidrop)d), .DORMANT(%(dormant)d)) target(.swclk(swclk), .line(swdi),
                  .drive(target_drive), .out_bit(target_bit));
 
     integer bases [0:%(cmax)d];
@@ -554,15 +615,21 @@ def main():
     parser.add_argument("--random", type=int, default=20, help="random DAP_Transfer commands")
     parser.add_argument("--multidrop", action="store_true",
                         help="a multi-drop target, selected by TARGETSEL as OpenOCD and probe-rs send it")
+    parser.add_argument("--dormant", action="store_true",
+                        help="a dormant target, woken as probe-rs and OpenOCD wake it")
     parser.add_argument("--vcd", action="store_true")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
-    cmds = (multidrop_script if args.multidrop else script)(rng, args.random)
+    if args.dormant:
+        cmds = dormant_script(rng, args.random, args.multidrop)
+    else:
+        cmds = (multidrop_script if args.multidrop else script)(rng, args.random)
     hi, lo = ticks_for(args.clock)
 
     # The reference's responses
-    reference = Reference(Target(args.wait_every, args.fault_at, args.write_fault_at, args.multidrop),
+    reference = Reference(Target(args.wait_every, args.fault_at, args.write_fault_at, args.multidrop,
+                                 args.dormant),
                           args.retry, args.match_retry)
     expected, masks = [], []
     for c in cmds:
@@ -572,7 +639,7 @@ def main():
     # The request buffer: each command at its own offset
     os.makedirs(OUT, exist_ok=True)
     tag = (f"{int(args.clock)}_{args.round_trip:g}_{args.wait_every}_{args.fault_at}_{args.write_fault_at}_"
-           f"{args.seed}{'_md' if args.multidrop else ''}")
+           f"{args.seed}{'_md' if args.multidrop else ''}{'_dm' if args.dormant else ''}")
     memory, bases = bytearray(), []
     for c in cmds:
         bases.append(len(memory))
@@ -589,7 +656,8 @@ def main():
         f.write(TESTBENCH % dict(
             retry=args.retry, match_retry=args.match_retry, hi=hi, lo=lo,
             round_trip=args.round_trip, wait_every=args.wait_every, fault_at=args.fault_at,
-            write_fault_at=args.write_fault_at, multidrop=int(args.multidrop), cmax=len(cmds), count=len(cmds),
+            write_fault_at=args.write_fault_at, multidrop=int(args.multidrop),
+            dormant=int(args.dormant), cmax=len(cmds), count=len(cmds),
             bytes=bytes_hex, bases=bases_hex, timeout=int(2e9),
             vcd=f'$dumpfile("{OUT}/slot_{tag}.vcd"); $dumpvars(0, tb);' if args.vcd else ""))
     vvp = os.path.join(OUT, f"slot_{tag}.vvp")
